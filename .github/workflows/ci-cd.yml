@@ -1,0 +1,88 @@
+name: CI-CD TechStore
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # 1) Qualidade: lint + testes automatizados + cobertura mínima
+  qualidade:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Lint (flake8)
+        run: flake8 app tests
+      - name: Testes (pytest) com cobertura mínima de 80%
+        run: pytest --cov=app --cov-fail-under=80 -v
+
+  # 2) Segurança do código e das dependências
+  seguranca-codigo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: SAST - análise estática do código (Bandit)
+        run: bandit -r app -ll
+      - name: Vulnerabilidades em dependências (pip-audit)
+        run: pip-audit -r app/requirements.txt
+
+  # 3) Build da imagem, scan da imagem e teste de fumaça
+  imagem:
+    runs-on: ubuntu-latest
+    needs: [qualidade, seguranca-codigo]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build da imagem Docker
+        run: docker build -t techstore:${{ github.sha }} .
+      - name: Scan da imagem (Trivy) - falha se HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: techstore:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Teste de fumaça (container sobe e responde?)
+        run: |
+          docker run -d --name techstore -p 8000:8000 techstore:${{ github.sha }}
+          sleep 5
+          curl --fail http://localhost:8000/health
+          docker rm -f techstore
+
+  # 4) Entrega: só em push na main, e só se TUDO acima passou
+  publicar:
+    runs-on: ubuntu-latest
+    needs: [imagem]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nome da imagem em minúsculas
+        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
